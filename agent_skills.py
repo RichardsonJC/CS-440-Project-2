@@ -24,13 +24,13 @@ DEFAULT_THRESHOLD = 0.20
 DEFAULT_LOG_PATH = Path("logs") / "skill_execution.log"
 MAX_INSTRUCTION_CHARS = 6000
 
-STOP_WORDS = frozenset(
-    """
-    a an and are as at be but by can could do does for from had has have how i if in into is it its
-    let me my of on or our please should so some than that the their them then there these this those
-    to up us was we what when where which while who why will with would you your
-    """.split()
-)
+STOP_WORDS = frozenset({
+    "a", "an", "and", "are", "as", "at", "be", "but", "by", "can", "could", "do", "does", "for",
+    "from", "had", "has", "have", "how", "i", "if", "in", "into", "is", "it", "its", "let", "me",
+    "my", "of", "on", "or", "our", "please", "should", "so", "some", "than", "that", "the", "their",
+    "them", "then", "there", "these", "this", "those", "to", "up", "us", "was", "we", "what", "when",
+    "where", "which", "while", "who", "why", "will", "with", "would", "you", "your",
+})
 
 
 def _now():
@@ -142,7 +142,7 @@ class SkillRegistry:
                     continue
                 try:
                     skill = parse_skill_file(skill_file)
-                except Exception as exc:
+                except (OSError, ValueError) as exc:
                     self.errors.append((skill_file, str(exc)))
                     continue
                 if skill.name in self.skills:
