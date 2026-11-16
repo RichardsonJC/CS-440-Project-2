@@ -10,9 +10,18 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent_skills import (
+    DEFAULT_LOG_PATH,
+    DEFAULT_THRESHOLD,
+    MAX_INSTRUCTION_CHARS,
+    SimilarityChecker,
+    SkillLogger,
+    SkillRegistry,
+    default_skill_roots,
+)
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-HELP_TEXT = "/help, /memory, /session, /reset, /exit"
+HELP_TEXT = "/help, /memory, /session, /skills, /reset, /exit"
 WELCOME_ART = (
     "/\\     /\\\\",
     "{  `---'  }",
@@ -27,6 +36,7 @@ HELP_DETAILS = "\n".join(
         "/help    Show this help message.",
         "/memory  Show the agent's distilled working memory.",
         "/session Show the path to the saved session file.",
+        "/skills  List discovered agent skills and the skill log path.",
         "/reset   Clear the current session history and memory.",
         "/exit    Exit the agent.",
     ]
@@ -44,6 +54,7 @@ IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cach
 # 4) Context Reduction And Output Management -> clip, history_text
 # 5) Transcripts, Memory, And Resumption -> SessionStore, record, note_tool, ask, reset
 # 6) Delegation And Bounded Subagents -> tool_delegate
+# 7) Agent Skills -> agent_skills.py, skills_text, active_skills_text, trigger_skills, tool_use_skill
 
 
 def now():
@@ -235,6 +246,8 @@ class MiniAgent:
         depth=0,
         max_depth=1,
         read_only=False,
+        skill_checker=None,
+        skill_logger=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -253,6 +266,11 @@ class MiniAgent:
             "history": [],
             "memory": {"task": "", "files": [], "notes": []},
         }
+        self.skill_checker = skill_checker
+        self.skill_logger = skill_logger
+        self.active_skills = []
+        if self.skill_logger is not None:
+            self.skill_logger.session_id = self.session["id"]
         self.tools = self.build_tools()
         self.prefix = self.build_prefix()
         self.session_path = self.session_store.save(self.session)
@@ -325,6 +343,13 @@ class MiniAgent:
                 "description": "Ask a bounded read-only child agent to investigate.",
                 "run": self.tool_delegate,
             }
+        if self.skill_checker is not None:
+            tools["use_skill"] = {
+                "schema": {"query": "str"},
+                "risky": False,
+                "description": "Load a skill's instructions by name or by describing what you need.",
+                "run": self.tool_use_skill,
+            }
         return tools
 
     ############################################
@@ -365,13 +390,68 @@ class MiniAgent:
             "- Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.",
             "- Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={}.",
         ])
-        return "\n\n".join([
+        if self.skill_checker is not None:
+            rules += (
+                "\n- If an 'Active skill' section is present, follow its instructions for the current request."
+                "\n- If a listed skill fits what you need next, call use_skill with its name before continuing."
+            )
+        sections = [
             "You are Mini-Coding-Agent, a small local coding agent running through Ollama.",
             "Rules:\n" + rules,
             "Tools:\n" + tool_text,
             "Valid response examples:\n" + examples,
-            self.workspace.text(),
-        ])
+        ]
+        if self.skill_checker is not None:
+            sections.append(self.skills_text())
+        sections.append(self.workspace.text())
+        return "\n\n".join(sections)
+
+    ##############################
+    #### 7) Agent Skills #########
+    ##############################
+    def skills_text(self):
+        skills = self.skill_checker.skills
+        lines = [f"- {skill.name}: {skill.description}" for skill in skills] or ["- none"]
+        return "Available skills (load with use_skill):\n" + "\n".join(lines)
+
+    def active_skills_text(self):
+        blocks = []
+        for skill in self.active_skills:
+            path = self.skill_logger.display_path(skill.path) if self.skill_logger else str(skill.path)
+            blocks.append(
+                f"Active skill: {skill.name} ({path})\n"
+                "Follow these skill instructions for the current request:\n"
+                + clip(skill.instructions, MAX_INSTRUCTION_CHARS)
+            )
+        return "\n\n".join(blocks)
+
+    def trigger_skills(self, query, source):
+        """Run a similarity check, log it, and activate the best skill if it passes the threshold."""
+        if self.skill_checker is None:
+            return None, []
+        logger = self.skill_logger
+        matches = self.skill_checker.score(query)
+        if logger:
+            logger.prompt_received(query, source)
+            logger.similarity_check(matches, self.skill_checker.threshold, self.skill_checker.method)
+        best = self.skill_checker.best(matches)
+        if best is None:
+            if logger:
+                logger.no_skill_triggered(matches, self.skill_checker.threshold)
+            return None, matches
+        if best.skill not in self.active_skills:
+            self.active_skills.append(best.skill)
+            self.record(
+                {
+                    "role": "skill",
+                    "name": best.skill.name,
+                    "content": f"activated skill {best.skill.name} (score={best.score:.4f}, source={source})",
+                    "created_at": now(),
+                }
+            )
+        if logger:
+            logger.skill_triggered(best, source, len(clip(best.skill.instructions, MAX_INSTRUCTION_CHARS)))
+        return best, matches
 
     def memory_text(self):
         memory = self.session["memory"]
@@ -420,12 +500,14 @@ class MiniAgent:
     #### 2) Prompt Shape And Cache Reuse (Continued) #######
     ########################################################
     def prompt(self, user_message):
-        return "\n\n".join([
-            self.prefix,
-            self.memory_text(),
+        sections = [self.prefix, self.memory_text()]
+        if self.active_skills:
+            sections.append(self.active_skills_text())
+        sections.extend([
             "Transcript:\n" + self.history_text(),
             "Current user request:\n" + user_message,
         ])
+        return "\n\n".join(sections)
 
     ###############################################
     #### 5) Session Memory (Continued) ###########
@@ -448,6 +530,18 @@ class MiniAgent:
             memory["task"] = clip(user_message.strip(), 300)
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
+        self.active_skills = []
+        if self.depth == 0:
+            self.trigger_skills(user_message, "user_prompt")
+        self.last_tool_steps = 0
+        final = self.run_loop(user_message)
+        if self.skill_logger:
+            for skill in self.active_skills:
+                self.skill_logger.execution_complete(skill, self.last_tool_steps, final)
+        return final
+
+    def run_loop(self, user_message):
+        memory = self.session["memory"]
         tool_steps = 0
         attempts = 0
         max_attempts = max(self.max_steps * 3, self.max_steps + 4)
@@ -459,6 +553,7 @@ class MiniAgent:
 
             if kind == "tool":
                 tool_steps += 1
+                self.last_tool_steps = tool_steps
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
@@ -530,6 +625,7 @@ class MiniAgent:
             "write_file": '<tool name="write_file" path="binary_search.py"><content>def binary_search(nums, target):\n    return -1\n</content></tool>',
             "patch_file": '<tool name="patch_file" path="binary_search.py"><old_text>return -1</old_text><new_text>return mid</new_text></tool>',
             "delegate": '<tool>{"name":"delegate","args":{"task":"inspect README.md","max_steps":3}}</tool>',
+            "use_skill": '<tool>{"name":"use_skill","args":{"query":"pr-review"}}</tool>',
         }
         return examples.get(name, "")
 
@@ -597,6 +693,11 @@ class MiniAgent:
             task = str(args.get("task", "")).strip()
             if not task:
                 raise ValueError("task must not be empty")
+            return
+
+        if name == "use_skill":
+            if not str(args.get("query", "")).strip():
+                raise ValueError("query must not be empty")
             return
 
     def approve(self, name, args):
@@ -865,6 +966,25 @@ class MiniAgent:
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
         return "delegate_result:\n" + child.ask(task)
 
+    ###################################################
+    #### 7) Agent Skills (Continued) ##################
+    ###################################################
+    def tool_use_skill(self, args):
+        query = str(args.get("query", "")).strip()
+        if not query:
+            raise ValueError("query must not be empty")
+        best, matches = self.trigger_skills(query, "agent_request")
+        scores = ", ".join(f"{match.skill.name}={match.score:.4f}" for match in matches) or "none"
+        if best is None:
+            return (
+                f"no skill matched (threshold={self.skill_checker.threshold:.2f}); scores: {scores}. "
+                "Continue without a skill."
+            )
+        return (
+            f"activated skill {best.skill.name} (score={best.score:.4f}); "
+            f"its instructions are now in the 'Active skill' section of the prompt. scores: {scores}"
+        )
+
 
 def build_welcome(agent, model, host):
     width = max(68, min(shutil.get_terminal_size((80, 20)).columns, 84))
@@ -919,27 +1039,59 @@ def build_agent(args):
         top_p=args.top_p,
         timeout=args.ollama_timeout,
     )
+    checker, logger = build_skills(args, workspace)
+    options = {
+        "approval_policy": args.approval,
+        "max_steps": args.max_steps,
+        "max_new_tokens": args.max_new_tokens,
+        "skill_checker": checker,
+        "skill_logger": logger,
+    }
     session_id = args.resume
     if session_id == "latest":
         session_id = store.latest()
     if session_id:
-        return MiniAgent.from_session(
+        agent = MiniAgent.from_session(
             model_client=model,
             workspace=workspace,
             session_store=store,
             session_id=session_id,
-            approval_policy=args.approval,
-            max_steps=args.max_steps,
-            max_new_tokens=args.max_new_tokens,
+            **options,
         )
-    return MiniAgent(
-        model_client=model,
-        workspace=workspace,
-        session_store=store,
-        approval_policy=args.approval,
-        max_steps=args.max_steps,
-        max_new_tokens=args.max_new_tokens,
-    )
+    else:
+        agent = MiniAgent(model_client=model, workspace=workspace, session_store=store, **options)
+    if logger is not None:
+        logger.discovery(checker.registry)
+    return agent
+
+
+def build_skills(args, workspace):
+    """Build the skill checker and logger from CLI args, or (None, None) when skills are disabled."""
+    if getattr(args, "no_skills", False):
+        return None, None
+    root = Path(workspace.repo_root)
+    registry = SkillRegistry(default_skill_roots(root, getattr(args, "skills_dir", None) or [])).discover()
+    checker = SimilarityChecker(registry, threshold=getattr(args, "skill_threshold", DEFAULT_THRESHOLD))
+    log_path = Path(getattr(args, "skill_log", None) or DEFAULT_LOG_PATH)
+    if not log_path.is_absolute():
+        log_path = root / log_path
+    logger = SkillLogger(log_path, console=not getattr(args, "quiet_skills", False), base_dir=root)
+    return checker, logger
+
+
+def skills_report(agent):
+    if agent.skill_checker is None:
+        return "skills are disabled (--no-skills)"
+    registry = agent.skill_checker.registry
+    lines = [f"Skills ({len(registry.enabled())} enabled, threshold={agent.skill_checker.threshold:.2f}):"]
+    for skill in registry.all():
+        status = "enabled " if skill.enabled else "disabled"
+        lines.append(f"- {skill.name:<16} [{status}] {agent.skill_logger.display_path(skill.path)}")
+        lines.append(f"    {skill.description}")
+    if not registry.all():
+        lines.append("- none found (add skill/<name>/skill.md)")
+    lines.append(f"Log: {agent.skill_logger.path}")
+    return "\n".join(lines)
 
 
 def build_arg_parser():
@@ -963,6 +1115,26 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    skills = parser.add_argument_group("agent skills")
+    skills.add_argument(
+        "--skills-dir",
+        action="append",
+        default=[],
+        help="Extra directory containing <name>/skill.md folders (repeatable). skill/ and skills/ are always scanned.",
+    )
+    skills.add_argument(
+        "--skill-threshold",
+        type=float,
+        default=DEFAULT_THRESHOLD,
+        help="Minimum TF-IDF cosine similarity needed to trigger a skill.",
+    )
+    skills.add_argument(
+        "--skill-log",
+        default=str(DEFAULT_LOG_PATH),
+        help="Skill execution log file (relative paths are resolved against the workspace root).",
+    )
+    skills.add_argument("--quiet-skills", action="store_true", help="Do not echo skill log events to the console.")
+    skills.add_argument("--no-skills", action="store_true", help="Disable the agent skills component.")
     return parser
 
 
@@ -1002,6 +1174,9 @@ def main(argv=None):
             continue
         if user_input == "/session":
             print(agent.session_path)
+            continue
+        if user_input == "/skills":
+            print(skills_report(agent))
             continue
         if user_input == "/reset":
             agent.reset()
