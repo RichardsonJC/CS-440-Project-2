@@ -140,7 +140,10 @@ way to call a skill by name.
    (from the next model call on, it is injected as in step 4) and returns
    the scores. If nothing triggers, it returns the scores and says no skill matched.
 6. **Completion:** when `ask()` returns, each skill that was active is logged
-   as `SKILL_EXECUTION_COMPLETE` with the step count and a clipped final answer.
+   as `SKILL_EXECUTION_COMPLETE` with the step count, the number of model calls whose
+   prompt actually contained the skill's instructions (counted in `run_loop()` right before each
+   model call), and a clipped final answer. A count of 0 means the step limit ended the request
+   right after a mid-execution activation, and it is flagged with a `WARNING` line.
 7. **Child agents** (`delegate`) do not run skills. They are read-only helpers
    and inherit the parent's context through notes.
 8. **Disabled mode:** `--no-skills` builds no registry. The agent then behaves
@@ -177,9 +180,9 @@ Each event is one header line followed by zero or more indented detail lines:
 | `SKILL_DUPLICATE_SKIPPED` | `name=... path=...` | none |
 | `PROMPT_RECEIVED` | `source=user_prompt\|agent_request` | `prompt: "<text, clipped to 500 chars>"` |
 | `SIMILARITY_CHECK` | `method=tfidf-cosine threshold=0.20 candidates=<n>` | one row per enabled skill, sorted by score: `rank  name  score=0.4312  method  MATCH\|below-threshold  path` |
-| `SKILL_TRIGGERED` | `skill=<name> score=<s> source=... path=<path>` | `injected <n> chars of instructions into the prompt` |
+| `SKILL_TRIGGERED` | `skill=<name> score=<s> source=... path=<path>` | `loaded <n> chars of skill.md instructions; injecting into every remaining model call` |
 | `NO_SKILL_TRIGGERED` | `best=<name\|none> best_score=<s> threshold=<t>` | none |
-| `SKILL_EXECUTION_COMPLETE` | `skill=<name> steps=<n>` | `final: "<answer, clipped to 300 chars>"` |
+| `SKILL_EXECUTION_COMPLETE` | `skill=<name> steps=<n> model_calls_with_instructions=<n>` | `WARNING: ...` if that count is 0; `final: "<answer, clipped to 300 chars>"` |
 
 ### 4.4 Example
 
@@ -190,10 +193,11 @@ Each event is one header line followed by zero or more indented detail lines:
     1. pr-review    score=0.7310  tfidf-cosine  MATCH            skill/pr-review/skill.md
     2. unit-tests   score=0.0000  tfidf-cosine  below-threshold  skill/unit-tests/skill.md
 2026-11-16T21:04:11+00:00 | session=20261116-160411-a1b2c3 | SKILL_TRIGGERED | skill=pr-review score=0.7310 source=user_prompt path=skill/pr-review/skill.md
-    injected 1496 chars of instructions into the prompt
+    loaded 1496 chars of skill.md instructions; injecting into every remaining model call
 ```
 
-Paths are written relative to the workspace root when possible, and absolute otherwise.
+Paths are written relative to the workspace root when possible, and absolute otherwise, always
+with forward slashes (`as_posix()`) so logs read identically on Windows, macOS, and Linux.
 
 ---
 
@@ -206,12 +210,50 @@ Paths are written relative to the workspace root when possible, and absolute oth
 | `--skill-log PATH` | `logs/skill_execution.log` | log file |
 | `--quiet-skills` | off | no console skill logging |
 | `--no-skills` | off | disable the component |
+| `--skill-check` | off | dry run: discovery + similarity check + logging for the prompt, print the section that would be injected, exit without calling the model |
+
+Path arguments (`--skills-dir`, `--skill-log`) accept `/` or `\` on any OS (`agent_skills.to_path`).
+`scripts/demo_skills.py` runs the full pipeline with a scripted model for three scenarios
+(prompt trigger, no trigger, mid-execution trigger).
 
 REPL command `/skills` lists discovered skills with their status and path.
+
+## 7. Hooks (component 8, `agent_hooks.py`)
+
+- **Config:** `<workspace>/hooks.json` (or `--hooks-file`; `--no-hooks` disables):
+  `{"pre_tool": [{"match": "<regex>", "command": "<shell>"}], "post_tool": [...]}`.
+  `match` is matched with `re.fullmatch` against the tool name. `{python}` in a command is
+  replaced by the interpreter running the agent. Unknown events or a missing `command` raise `ValueError` at startup.
+- **Order in `MiniAgent.run_tool`:** validate → repeated-call check → **pre_tool** → approval → run → **post_tool**.
+- **Protocol:** each hook receives `{"event", "tool", "args", "result"?}` as JSON on stdin, runs in the workspace root, timeout 30 s.
+  - `pre_tool` exit 2 blocks the tool, and the model sees `error: blocked by pre_tool hook: <output>`.
+  - Any other non-zero exit is logged as `status=error` and does not block.
+  - `post_tool` stdout is appended to the tool result as `[post_tool hook] <output>`.
+- **Sub-agents:** `delegate` children inherit the parent's `HookRunner`.
+- **Logging:** `HOOKS_LOADED`, `HOOK_PRE_TOOL`, `HOOK_POST_TOOL` events in the execution log, plus
+  `TOOL_CALL` (tool, clipped args, first 4 result lines) for every top-level tool call. The log is
+  created when skills or hooks are enabled.
+- **Bundled hooks:** `hooks/block_dangerous_shell.py` (pre_tool on `run_shell`) and
+  `hooks/check_python_syntax.py` (post_tool on `write_file|patch_file`).
+
+## 8. Lab 5 Skill (`skill/lab5-skill/`)
+
+- **`skill.md`** (`name: lab5-vacuum-rl`) specifies:
+  - the Lab 4 grid: start (0,0), wall (1,1), terminals (3,1) = -1 and (3,3) = +10
+  - actions, and noisy transitions (`slip = 0.2`, hidden from the agent)
+  - the parameters (living reward -0.04, γ 0.9, α 0.1, ε 0.2) with justifications
+  - the required API (`VacuumGridEnv`, `init_q_table`, `epsilon_greedy`, `q_update`)
+  - six steps: write the file, run the grader, fix, run the demo, delegate a review, answer.
+- **`check_lab4.py <file>`** runs 10 PASS/FAIL checks (parameters, layout, reset, moves and living
+  reward, edges and wall, terminals, stochasticity, Q-table, ε-greedy, Q-update) and exits 0 only when all pass.
+- `--num-ctx` (default unset) is passed to Ollama as `options.num_ctx`. Use 16384 for this skill.
 
 ## 6. Testing
 
 New tests in `tests/test_agent_skills.py` (no network; `FakeModelClient`):
 discovery and front-matter parsing, disabled and `_template` skipping,
 similarity ranking and threshold behaviour, name-match override, prompt
-injection, the `use_skill` tool path, log file contents, and `--no-skills` parity.
+injection, the `use_skill` tool path, log file contents, `--no-skills` parity, `/` vs `\`
+skill directories, the zero-injection warning, `--skill-check`, and the demo script.
+`tests/test_agent_hooks.py` covers config validation, blocking, non-blocking errors, post_tool
+appending, logging order, hook inheritance by sub-agents, the CLI loading hooks, both bundled hook scripts, and `num_ctx`.

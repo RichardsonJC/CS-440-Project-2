@@ -10,6 +10,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
+from agent_hooks import HOOKS_FILE_NAME, HookRunner
 from agent_skills import (
     DEFAULT_LOG_PATH,
     DEFAULT_THRESHOLD,
@@ -18,10 +19,11 @@ from agent_skills import (
     SkillLogger,
     SkillRegistry,
     default_skill_roots,
+    to_path,
 )
 
 DOC_NAMES = ("AGENTS.md", "README.md", "pyproject.toml", "package.json")
-HELP_TEXT = "/help, /memory, /session, /skills, /reset, /exit"
+HELP_TEXT = "/help, /memory, /session, /skills, /hooks, /reset, /exit"
 WELCOME_ART = (
     "/\\     /\\\\",
     "{  `---'  }",
@@ -37,6 +39,7 @@ HELP_DETAILS = "\n".join(
         "/memory  Show the agent's distilled working memory.",
         "/session Show the path to the saved session file.",
         "/skills  List discovered agent skills and the skill log path.",
+        "/hooks   List the hooks loaded from hooks.json.",
         "/reset   Clear the current session history and memory.",
         "/exit    Exit the agent.",
     ]
@@ -55,6 +58,7 @@ IGNORED_PATH_NAMES = {".git", ".mini-coding-agent", "__pycache__", ".pytest_cach
 # 5) Transcripts, Memory, And Resumption -> SessionStore, record, note_tool, ask, reset
 # 6) Delegation And Bounded Subagents -> tool_delegate
 # 7) Agent Skills -> agent_skills.py, skills_text, active_skills_text, trigger_skills, tool_use_skill
+# 8) Hooks -> agent_hooks.py, run_tool (pre_tool / post_tool)
 
 
 def now():
@@ -188,8 +192,9 @@ class FakeModelClient:
 
 
 class OllamaModelClient:
-    def __init__(self, model, host, temperature, top_p, timeout):
+    def __init__(self, model, host, temperature, top_p, timeout, num_ctx=None):
         self.model = model
+        self.num_ctx = num_ctx
         self.host = host.rstrip("/")
         self.temperature = temperature
         self.top_p = top_p
@@ -208,6 +213,8 @@ class OllamaModelClient:
                 "top_p": self.top_p,
             },
         }
+        if self.num_ctx:
+            payload["options"]["num_ctx"] = self.num_ctx
         request = urllib.request.Request(
             self.host + "/api/generate",
             data=json.dumps(payload).encode("utf-8"),
@@ -248,6 +255,7 @@ class MiniAgent:
         read_only=False,
         skill_checker=None,
         skill_logger=None,
+        hook_runner=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -268,6 +276,7 @@ class MiniAgent:
         }
         self.skill_checker = skill_checker
         self.skill_logger = skill_logger
+        self.hook_runner = hook_runner
         self.active_skills = []
         if self.skill_logger is not None:
             self.skill_logger.session_id = self.session["id"]
@@ -531,13 +540,15 @@ class MiniAgent:
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
         self.active_skills = []
+        self.skill_model_calls = {}
         if self.depth == 0:
             self.trigger_skills(user_message, "user_prompt")
         self.last_tool_steps = 0
         final = self.run_loop(user_message)
         if self.skill_logger:
             for skill in self.active_skills:
-                self.skill_logger.execution_complete(skill, self.last_tool_steps, final)
+                calls = self.skill_model_calls.get(skill.name, 0)
+                self.skill_logger.execution_complete(skill, self.last_tool_steps, calls, final)
         return final
 
     def run_loop(self, user_message):
@@ -548,7 +559,10 @@ class MiniAgent:
 
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
-            raw = self.model_client.complete(self.prompt(user_message), self.max_new_tokens)
+            prompt = self.prompt(user_message)
+            for skill in self.active_skills:
+                self.skill_model_calls[skill.name] = self.skill_model_calls.get(skill.name, 0) + 1
+            raw = self.model_client.complete(prompt, self.max_new_tokens)
             kind, payload = self.parse(raw)
 
             if kind == "tool":
@@ -557,6 +571,8 @@ class MiniAgent:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 result = self.run_tool(name, args)
+                if self.skill_logger and self.depth == 0:
+                    self.skill_logger.tool_call(name, args, result)
                 self.record(
                     {
                         "role": "tool",
@@ -602,12 +618,21 @@ class MiniAgent:
             return message
         if self.repeated_tool_call(name, args):
             return f"error: repeated identical tool call for {name}; choose a different tool or return a final answer"
+        if self.hook_runner:
+            pre = self.hook_runner.run("pre_tool", name, args)
+            if pre.blocked:
+                return f"error: blocked by pre_tool hook: {' '.join(pre.messages)}"
         if tool["risky"] and not self.approve(name, args):
             return f"error: approval denied for {name}"
         try:
-            return clip(tool["run"](args))
+            result = clip(tool["run"](args))
         except Exception as exc:
-            return f"error: tool {name} failed: {exc}"
+            result = f"error: tool {name} failed: {exc}"
+        if self.hook_runner:
+            post = self.hook_runner.run("post_tool", name, args, result)
+            if post.messages:
+                result += "\n" + "\n".join(f"[post_tool hook] {message}" for message in post.messages)
+        return result
 
     def repeated_tool_call(self, name, args):
         tool_events = [item for item in self.session["history"] if item["role"] == "tool"]
@@ -961,6 +986,7 @@ class MiniAgent:
             depth=self.depth + 1,
             max_depth=self.max_depth,
             read_only=True,
+            hook_runner=self.hook_runner,
         )
         child.session["memory"]["task"] = task
         child.session["memory"]["notes"] = [clip(self.history_text(), 300)]
@@ -1038,14 +1064,21 @@ def build_agent(args):
         temperature=args.temperature,
         top_p=args.top_p,
         timeout=args.ollama_timeout,
+        num_ctx=getattr(args, "num_ctx", None),
     )
-    checker, logger = build_skills(args, workspace)
+    root = Path(workspace.repo_root)
+    hooks = build_hooks(args, root)
+    checker = build_skills(args, workspace)
+    logger = build_logger(args, root) if (checker or hooks) else None
+    if hooks:
+        hooks.logger = logger
     options = {
         "approval_policy": args.approval,
         "max_steps": args.max_steps,
         "max_new_tokens": args.max_new_tokens,
         "skill_checker": checker,
         "skill_logger": logger,
+        "hook_runner": hooks,
     }
     session_id = args.resume
     if session_id == "latest":
@@ -1060,23 +1093,38 @@ def build_agent(args):
         )
     else:
         agent = MiniAgent(model_client=model, workspace=workspace, session_store=store, **options)
-    if logger is not None:
+    if checker is not None:
         logger.discovery(checker.registry)
+    if hooks:
+        hooks.log_loaded()
     return agent
 
 
 def build_skills(args, workspace):
-    """Build the skill checker and logger from CLI args, or (None, None) when skills are disabled."""
+    """Build the skill checker from CLI args, or None when skills are disabled."""
     if getattr(args, "no_skills", False):
-        return None, None
+        return None
     root = Path(workspace.repo_root)
     registry = SkillRegistry(default_skill_roots(root, getattr(args, "skills_dir", None) or [])).discover()
-    checker = SimilarityChecker(registry, threshold=getattr(args, "skill_threshold", DEFAULT_THRESHOLD))
-    log_path = Path(getattr(args, "skill_log", None) or DEFAULT_LOG_PATH)
+    return SimilarityChecker(registry, threshold=getattr(args, "skill_threshold", DEFAULT_THRESHOLD))
+
+
+def build_hooks(args, root):
+    """Load <workspace>/hooks.json (or --hooks-file) into a HookRunner, or None when absent/disabled."""
+    if getattr(args, "no_hooks", False):
+        return None
+    path = to_path(getattr(args, "hooks_file", None) or HOOKS_FILE_NAME)
+    if not path.is_absolute():
+        path = root / path
+    return HookRunner.from_file(path, root)
+
+
+def build_logger(args, root):
+    """One execution log shared by skills, hooks, and tool calls (default logs/skill_execution.log)."""
+    log_path = to_path(getattr(args, "skill_log", None) or DEFAULT_LOG_PATH)
     if not log_path.is_absolute():
         log_path = root / log_path
-    logger = SkillLogger(log_path, console=not getattr(args, "quiet_skills", False), base_dir=root)
-    return checker, logger
+    return SkillLogger(log_path, console=not getattr(args, "quiet_skills", False), base_dir=root)
 
 
 def skills_report(agent):
@@ -1092,6 +1140,21 @@ def skills_report(agent):
         lines.append("- none found (add skill/<name>/skill.md)")
     lines.append(f"Log: {agent.skill_logger.path}")
     return "\n".join(lines)
+
+
+def skill_check(agent, prompt):
+    """Dry run: discovery + similarity check + logging for one prompt, without calling the model."""
+    if agent.skill_checker is None:
+        print("skills are disabled (--no-skills)", file=sys.stderr)
+        return 1
+    best, _ = agent.trigger_skills(prompt, "user_prompt")
+    if best is None:
+        print("\nDRY RUN: no skill triggered; the agent would run with its default prompt.")
+        return 0
+    print(f"\nDRY RUN: would execute {best.skill.name} ({agent.skill_logger.display_path(best.skill.path)}).")
+    print("Prompt section that would be injected into every model call:\n")
+    print(agent.active_skills_text())
+    return 0
 
 
 def build_arg_parser():
@@ -1115,6 +1178,12 @@ def build_arg_parser():
     parser.add_argument("--max-new-tokens", type=int, default=512, help="Maximum model output tokens per step.")
     parser.add_argument("--temperature", type=float, default=0.2, help="Sampling temperature sent to Ollama.")
     parser.add_argument("--top-p", type=float, default=0.9, help="Top-p sampling value sent to Ollama.")
+    parser.add_argument(
+        "--num-ctx",
+        type=int,
+        default=None,
+        help="Ollama context window in tokens (e.g. 16384); unset uses the Ollama default, which may truncate long prompts.",
+    )
     skills = parser.add_argument_group("agent skills")
     skills.add_argument(
         "--skills-dir",
@@ -1130,17 +1199,31 @@ def build_arg_parser():
     )
     skills.add_argument(
         "--skill-log",
-        default=str(DEFAULT_LOG_PATH),
+        default=DEFAULT_LOG_PATH.as_posix(),
         help="Skill execution log file (relative paths are resolved against the workspace root).",
     )
     skills.add_argument("--quiet-skills", action="store_true", help="Do not echo skill log events to the console.")
     skills.add_argument("--no-skills", action="store_true", help="Disable the agent skills component.")
+    hooks = parser.add_argument_group("hooks")
+    hooks.add_argument("--hooks-file", default=None, help="Hooks config file; default: <workspace>/hooks.json if it exists.")
+    hooks.add_argument("--no-hooks", action="store_true", help="Do not run hooks even if hooks.json exists.")
+    skills.add_argument(
+        "--skill-check",
+        action="store_true",
+        help="Dry run: log the similarity check for the prompt and show the skill that would run, without calling the model.",
+    )
     return parser
 
 
 def main(argv=None):
-    args = build_arg_parser().parse_args(argv)
+    parser = build_arg_parser()
+    args = parser.parse_args(argv)
+    prompt = " ".join(args.prompt).strip()
+    if args.skill_check and not prompt:
+        parser.error("--skill-check needs a prompt, e.g. --skill-check \"review my pull request\"")
     agent = build_agent(args)
+    if args.skill_check:
+        return skill_check(agent, prompt)
 
     print(build_welcome(agent, model=args.model, host=args.host))
 
@@ -1177,6 +1260,9 @@ def main(argv=None):
             continue
         if user_input == "/skills":
             print(skills_report(agent))
+            continue
+        if user_input == "/hooks":
+            print(agent.hook_runner.report() if agent.hook_runner else "no hooks loaded (add hooks.json)")
             continue
         if user_input == "/reset":
             agent.reset()

@@ -110,8 +110,13 @@ def default_skill_roots(workspace_root, extra_dirs=()):
     workspace_root = Path(workspace_root)
     roots = [workspace_root / name for name in DEFAULT_SKILL_DIR_NAMES]
     roots.append(Path(__file__).resolve().parent / "skill")
-    roots.extend(Path(item) for item in extra_dirs)
+    roots.extend(to_path(item) for item in extra_dirs)
     return roots
+
+
+def to_path(raw):
+    """Accept 'skill/pr-review' or 'skill\\pr-review' on any OS (Windows accepts '/' too)."""
+    return Path(str(raw).replace("\\", "/"))
 
 
 class SkillRegistry:
@@ -257,13 +262,14 @@ class SkillLogger:
         self.stream = stream
 
     def display_path(self, path):
+        """Workspace-relative when possible; always forward slashes so logs read the same on every OS."""
         path = Path(path)
         if self.base_dir:
             try:
                 return path.resolve().relative_to(self.base_dir).as_posix()
             except ValueError:
                 pass
-        return str(path)
+        return path.as_posix()
 
     def write(self, event, fields="", details=()):
         header = f"{_now()} | session={self.session_id} | {event}"
@@ -314,7 +320,7 @@ class SkillLogger:
         self.write(
             "SKILL_TRIGGERED",
             f"skill={match.skill.name} score={match.score:.4f} source={source} path={self.display_path(match.skill.path)}",
-            [f"injected {injected_chars} chars of instructions into the prompt"],
+            [f"loaded {injected_chars} chars of skill.md instructions; injecting into every remaining model call"],
         )
 
     def no_skill_triggered(self, matches, threshold):
@@ -325,9 +331,21 @@ class SkillLogger:
             f"threshold={threshold:.2f}",
         )
 
-    def execution_complete(self, skill, steps, final):
+    def tool_call(self, name, args, result):
+        args_text = _clip(" ".join(str(args).split()), 200)
+        lines = str(result).splitlines() or ["(empty)"]
+        details = [_clip(line, 160) for line in lines[:4]]
+        if len(lines) > 4:
+            details.append(f"... ({len(lines) - 4} more lines)")
+        self.write("TOOL_CALL", f"tool={name} args={args_text}", details)
+
+    def execution_complete(self, skill, steps, model_calls, final):
+        """model_calls = how many model calls actually received this skill's instructions."""
+        details = [f'final: "{_clip(" ".join(str(final).split()), 300)}"']
+        if model_calls == 0:
+            details.insert(0, "WARNING: instructions never reached the model (step limit hit right after activation)")
         self.write(
             "SKILL_EXECUTION_COMPLETE",
-            f"skill={skill.name} steps={steps}",
-            [f'final: "{_clip(" ".join(str(final).split()), 300)}"'],
+            f"skill={skill.name} steps={steps} model_calls_with_instructions={model_calls}",
+            details,
         )

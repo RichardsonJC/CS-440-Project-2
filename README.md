@@ -48,10 +48,12 @@ This coding harness is organized around six practical building blocks:
 6. **Delegation and bounded subagents**  
    Scoped subtasks can be delegated to helper agents that inherit enough context to help (but operate within limits).
 
-This fork adds a seventh component (CS 440 Lab 4):
+This fork adds two components (CS 440 Labs 4 and 5):
 
 7. **Agent skills**  
    Skill folders (`skill/<name>/skill.md`) are discovered at startup. Each prompt is scored against every skill with TF-IDF cosine similarity. The best match above a threshold has its `skill.md` instructions injected into the prompt, and every step is logged to `logs/skill_execution.log`. See [Agent Skills](#agent-skills).
+8. **Hooks**  
+   Shell commands from `hooks.json` run before (`pre_tool`, can block) and after (`post_tool`, output shown to the model) tool calls. See [Lab 5](#lab-5-solving-lab-4-with-the-agent).
 
 &nbsp;
 ## Project Structure
@@ -59,17 +61,28 @@ This fork adds a seventh component (CS 440 Lab 4):
 ```text
 CS-440-Project-2/
 ├── mini_coding_agent.py        # the agent: components 1-6 plus skill wiring (component 7)
-├── agent_skills.py             # component 7: skill discovery, similarity checker, audit logger
+├── agent_skills.py             # component 7: skill discovery, similarity checker, execution logger
+├── agent_hooks.py              # component 8: pre_tool / post_tool hooks from hooks.json
+├── hooks.json                  # hook config: guard run_shell, syntax-check every written .py file
+├── hooks/
+│   ├── block_dangerous_shell.py # pre_tool: blocks rm -rf, git push/merge/reset --hard, ... (exit 2)
+│   └── check_python_syntax.py  # post_tool: compiles the written .py file, reports to the model
 ├── skill/                      # skill library: one folder per skill, each with a skill.md
 │   ├── pr-review/skill.md      # working example: pull-request / diff review (Lab 4)
 │   ├── unit-tests/skill.md     # second example: write and run pytest tests
-│   ├── lab5-skill/skill.md     # Lab 5 placeholder (enabled: false until filled in)
+│   ├── lab5-skill/
+│   │   ├── skill.md            # Lab 5 skill: solve Lab 4 (vacuum robot RL grid world)
+│   │   └── check_lab4.py       # grader the skill runs: 10 PASS/FAIL checks on lab4/vacuum_rl.py
 │   └── _template/skill.md      # copy-me template (folders starting with "_" are ignored)
 ├── logs/
 │   └── skill_execution.log     # created on first run: prompt -> similarity scores -> triggered skill
+├── scripts/
+│   └── demo_skills.py          # end-to-end demo of all three trigger cases, no Ollama needed
 ├── tests/
 │   ├── test_mini_coding_agent.py
-│   └── test_agent_skills.py    # tests for the skills component
+│   ├── test_agent_skills.py    # tests for the skills component
+│   └── test_agent_hooks.py     # tests for hooks and the bundled hook scripts
+├── lab4/vacuum_rl.py           # written BY THE AGENT during the Lab 4 run (not in the repo beforehand)
 ├── intent.md                   # SDLC: goal and success criteria
 ├── spec.md                     # SDLC: technical specification
 ├── plan.md                     # SDLC: implementation plan
@@ -224,6 +237,8 @@ being sent to the model as a normal task.
   prints the distilled session memory, including the current task, tracked files, and notes
 - `/session`
   prints the path to the current saved session JSON file
+- `/hooks`
+  lists the hooks loaded from `hooks.json`
 - `/skills`
   lists discovered skills (enabled/disabled), their paths, the threshold, and the skill log path
 - `/reset`
@@ -269,6 +284,10 @@ Important flags:
   caps the model output length for each step; default: `512`
 - `--temperature`
   controls sampling randomness; default: `0.2`
+- `--num-ctx`
+  Ollama context window in tokens; default: Ollama's own default. Use `16384` for skill runs: prompts with skill instructions reach about 3,700 tokens, which Ollama's default window may truncate
+- `--hooks-file PATH` / `--no-hooks`
+  use a different hooks config, or skip hooks; default: `<workspace>/hooks.json` when present
 - `--top-p`
   controls nucleus sampling for generation; default: `0.9`
 
@@ -284,6 +303,10 @@ Agent skills flags:
   stops echoing skill log events to the terminal (the log file is still written)
 - `--no-skills`
   turns the skills component off completely, restoring the original agent behaviour
+- `--skill-check`
+  dry run: runs discovery and the similarity check for the prompt, logs it, and prints the `skill.md` section that would be injected, without calling the model (no Ollama needed)
+
+Paths may be written with `/` or `\` on any OS (for example `--skills-dir skills\extra` on Linux works).
 
 &nbsp;
 ## Agent Skills
@@ -315,9 +338,21 @@ Step-by-step instructions for the agent...
 
 Matching uses only `name`, `description`, and `triggers`, so make those specific. The body is what the agent follows once the skill triggers. To add a skill, copy `skill/_template/` to `skill/<your-skill>/`, edit it, and restart the agent. Run `/skills` to confirm it loaded.
 
-**Lab 5:** fill in `skill/lab5-skill/skill.md` (it explains what to change) and set `enabled: true`.
+The Lab 5 skill is in `skill/lab5-skill/`; see [Lab 5](#lab-5-solving-lab-4-with-the-agent).
 
 ### Try it
+
+**Step 1: verify the pipeline without Ollama** (good for the demo video):
+
+```bash
+python -m pytest -q                      # unit + integration tests, including the demo below
+python scripts/demo_skills.py            # 3 scenarios: prompt trigger, no trigger, mid-execution trigger
+python mini_coding_agent.py --skill-check "Please review the changes in my pull request"
+```
+
+`demo_skills.py` runs the real agent loop with a scripted model in place of Ollama, so the answers are canned, but discovery, similarity, injection, `use_skill`, and logging are all the real code. Each scenario ends with `skills whose instructions reached the model: [...]`.
+
+**Step 2: run with a real model** (needs `ollama serve` and a pulled model, see [Install Ollama](#install-ollama)):
 
 ```bash
 # triggers skill/pr-review
@@ -344,6 +379,68 @@ Approximate scores against the bundled skills with the default threshold of `0.2
 TF-IDF matches words, not meaning. A paraphrase that shares few words with a skill's triggers will not match, so add likely phrasings to `triggers:`.
 
 &nbsp;
+## Lab 5: Solving Lab 4 With the Agent
+
+### Lab 4 task (vacuum robot, model-free RL)
+
+```text
+start |  0  |  0  |  0
+  0   |  X  |  0  |  0
+  0   |  0  |  0  |  0
+  0   | -1  |  0  | 10
+```
+
+The agent writes `lab4/vacuum_rl.py`:
+- **Environment:** a `VacuumGridEnv` where transitions and rewards are hidden inside `step()` (noisy moves, `slip=0.2`), so a Q-learning agent only learns from experience.
+- **Q-learning pieces:** the Q-table, epsilon-greedy action selection, and the update rule.
+- **Demo:** 3 short episodes. This is preparation for Q-learning, not full training.
+
+### The 3 agentic features used (Lab 5 requires 3 of 4)
+
+| Feature | Where | What it does in the Lab 4 run |
+|---|---|---|
+| **Skills** | `agent_skills.py`, `skill/lab5-skill/skill.md` | the prompt triggers `lab5-vacuum-rl`; its instructions (grid, API, parameters, steps) are injected into every model call |
+| **Hooks** | `agent_hooks.py`, `hooks.json`, `hooks/` | `post_tool` syntax-checks `lab4/vacuum_rl.py` after every write; `pre_tool` blocks destructive shell commands such as `git push` |
+| **Sub-agents** | `tool_delegate` in `mini_coding_agent.py` | the skill's step 5 delegates a read-only review of the parameters to a bounded child agent |
+
+MCP is the feature we did not use.
+
+### RL parameters
+
+| Parameter | Value | Justification |
+|---|---|---|
+| Living reward | `-0.04` | a small cost per step pushes the robot toward the shortest path to +10, but is far too small to make ending at -1 worthwhile |
+| Discount factor γ | `0.9` | the goal is about 6 steps from start; 0.9⁶ ≈ 0.53, so +10 still dominates, and γ < 1 keeps returns bounded |
+| Learning rate α | `0.1` | transitions are stochastic, so a small step size averages noisy samples instead of chasing each one |
+| Exploration rate ε | `0.2` | 20% random actions is enough to discover (3,3) behind the wall in a 15-state grid; decay it once full training starts |
+
+### Run it (demo video)
+
+Prerequisites: `ollama serve` running and `ollama pull qwen3.5:4b` (or a larger model).
+
+```bash
+# 1. dry run: confirm the Lab 5 skill triggers (no model call)
+python mini_coding_agent.py --skill-check "Solve Lab 4: build the vacuum robot reinforcement learning grid world"
+
+# 2. the real run (approve each risky step on camera; or use --approval auto)
+python mini_coding_agent.py --max-steps 12 --max-new-tokens 2048 --num-ctx 16384 \
+  "Solve Lab 4: build the vacuum robot reinforcement learning grid world"
+
+# 3. verify the agent's solution independently
+python skill/lab5-skill/check_lab4.py lab4/vacuum_rl.py     # expect: RESULT: 10/10 checks passed
+python lab4/vacuum_rl.py                                    # grid, parameters, 3 demo episodes
+```
+
+On Windows PowerShell, put the command on one line or replace `\` with a backtick.
+
+The full trace is in `logs/skill_execution.log`, in this order: `SKILL_DISCOVERY`, `HOOKS_LOADED`, `PROMPT_RECEIVED`, `SIMILARITY_CHECK`, `SKILL_TRIGGERED`, then `HOOK_*` and `TOOL_CALL` for each step (write, grader, demo, delegate), and finally `SKILL_EXECUTION_COMPLETE`.
+
+Tips:
+- Small models may need more than one attempt. If the run stops early, rerun the same command: the agent sees the grader's FAIL lines and patches them.
+- `--max-new-tokens 2048` is needed because the solution file alone is about 900 tokens.
+- `lab4/vacuum_rl.py` is linted by CI (`ruff`) once committed. Run `ruff check lab4` before pushing.
+
+&nbsp;
 ## Inspecting Skill Logs
 
 The skill audit log is written to:
@@ -361,8 +458,8 @@ The same events are printed to the terminal with a `[skills]` prefix (turn this 
     1. pr-review        score=0.7310  tfidf-cosine  MATCH            skill/pr-review/skill.md
     2. unit-tests       score=0.0000  tfidf-cosine  below-threshold  skill/unit-tests/skill.md
 2026-11-16T21:04:11+00:00 | session=20261116-160411-a1b2c3 | SKILL_TRIGGERED | skill=pr-review score=0.7310 source=user_prompt path=skill/pr-review/skill.md
-    injected 1496 chars of instructions into the prompt
-2026-11-16T21:04:30+00:00 | session=20261116-160411-a1b2c3 | SKILL_EXECUTION_COMPLETE | skill=pr-review steps=3
+    loaded 1496 chars of skill.md instructions; injecting into every remaining model call
+2026-11-16T21:04:30+00:00 | session=20261116-160411-a1b2c3 | SKILL_EXECUTION_COMPLETE | skill=pr-review steps=3 model_calls_with_instructions=4
     final: "Summary: ... Verdict: COMMENT ..."
 ```
 
@@ -373,8 +470,11 @@ The same events are printed to the terminal with a `[skills]` prefix (turn this 
 | `SIMILARITY_CHECK` | every candidate skill's score, ranked, with MATCH / below-threshold |
 | `SKILL_TRIGGERED` | the skill that was executed: name, score, and `skill.md` path |
 | `NO_SKILL_TRIGGERED` | the best score was under the threshold |
-| `SKILL_EXECUTION_COMPLETE` | the request finished with that skill active: tool steps used and the final answer |
+| `SKILL_EXECUTION_COMPLETE` | the request finished with that skill active: tool steps, how many model calls actually received the instructions, and the final answer (a `WARNING` line appears if that count is 0) |
 | `SKILL_LOAD_ERROR` / `SKILL_DUPLICATE_SKIPPED` | a malformed `skill.md`, or a second skill with the same name |
+| `HOOKS_LOADED` | hooks read from `hooks.json` |
+| `HOOK_PRE_TOOL` / `HOOK_POST_TOOL` | a hook ran: tool, `status=ok/error/BLOCKED`, exit code, output |
+| `TOOL_CALL` | each top-level tool call: name, arguments (clipped), first lines of the result |
 
 The session JSON in `.mini-coding-agent/sessions/` also gets a `{"role": "skill", ...}` entry each time a skill activates, and the session id in each log line identifies that file.
 

@@ -45,10 +45,18 @@ Add a seventh component, **Agent Skills**, that lets the agent:
 - Executing arbitrary code shipped inside a skill folder. A skill is
   instructions only; any actions still go through the existing approval-gated tools.
 - Running several skills at once for one prompt (top-1 by default; configurable later).
+- MCP (the fourth Lab 5 feature): not needed to meet 3 of 4.
+- Full Q-learning training (Lab 4 only prepares for it).
 
 ## Course Context (CS 440 Labs 4 and 5)
 
-- **Lab 4:** this component, the SDLC documents (`intent.md`, `spec.md`,
-  `plan.md`), and a working example skill (`skill/pr-review`).
-- **Lab 5:** a placeholder skill folder (`skill/lab5-skill/`) is ready to be
-  filled in. It is disabled until its `skill.md` is written.
+- **Project 2 (this repo):** the skills component, the SDLC documents (`intent.md`,
+  `spec.md`, `plan.md`), and a working example skill (`skill/pr-review`).
+- **Lab 4:** the vacuum robot task: a model-free 4x4 grid world prepared for Q-learning.
+- **Lab 5:** use the agent to solve Lab 4 (vacuum robot RL grid world) with
+  3 of 4 agentic features. We use **skills** (`skill/lab5-skill/`), **hooks**
+  (component 8, `agent_hooks.py` + `hooks.json`), and **sub-agents** (the existing
+  `delegate` tool), with chosen RL parameters (living reward -0.04,
+  gamma 0.9, alpha 0.1, epsilon 0.2). Success: the agent writes
+  `lab4/vacuum_rl.py`, it passes `skill/lab5-skill/check_lab4.py` (10/10),
+  and the whole run is visible in `logs/skill_execution.log`.

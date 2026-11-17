@@ -7,8 +7,10 @@ from agent_skills import (
     SimilarityChecker,
     SkillLogger,
     SkillRegistry,
+    default_skill_roots,
     parse_skill_file,
     split_front_matter,
+    to_path,
     tokenize,
 )
 from mini_coding_agent import (
@@ -17,6 +19,7 @@ from mini_coding_agent import (
     SessionStore,
     WorkspaceContext,
     build_arg_parser,
+    main,
 )
 from mini_coding_agent import (
     build_agent as build_cli_agent,
@@ -260,7 +263,7 @@ def test_agent_can_request_skill_mid_execution(tmp_path):
     assert tool_event["content"].startswith("activated skill unit-tests")
     log = read_log(tmp_path)
     assert "source=agent_request" in log
-    assert "SKILL_EXECUTION_COMPLETE | skill=unit-tests steps=1" in log
+    assert "SKILL_EXECUTION_COMPLETE | skill=unit-tests steps=1 model_calls_with_instructions=1" in log
 
 
 def test_use_skill_reports_no_match(tmp_path):
@@ -332,3 +335,82 @@ def test_cli_no_skills_restores_original_behaviour(tmp_path):
     assert "use_skill" not in agent.tools
     assert "Available skills" not in agent.prefix
     assert not (tmp_path / "logs").exists()
+
+
+#### Cross-platform paths ####
+
+def test_backslash_and_forward_slash_skill_dirs_both_work(tmp_path):
+    write_skill(tmp_path / "extra" / "nested", "demo", name="demo-skill")
+    backslash = str(tmp_path / "extra" / "nested").replace("/", "\\")
+    forward = (tmp_path / "extra" / "nested").as_posix()
+
+    for raw in (backslash, forward):
+        assert to_path(raw).resolve() == (tmp_path / "extra" / "nested").resolve()
+        roots = default_skill_roots(tmp_path, [raw])
+        assert SkillRegistry(roots).discover().get("demo-skill") is not None
+
+
+def test_new_skill_folder_is_picked_up_without_code_changes(tmp_path):
+    root = make_skills(tmp_path)
+    write_skill(root, "docs-writer", name="docs-writer", description="Write README documentation", triggers="readme, docs")
+
+    checker = SimilarityChecker(SkillRegistry([root]).discover())
+
+    assert checker.best(checker.score("update the readme docs")).skill.name == "docs-writer"
+
+
+def test_log_paths_use_forward_slashes_outside_workspace(tmp_path):
+    logger = SkillLogger(tmp_path / "x.log", console=False, base_dir=tmp_path / "elsewhere")
+
+    assert "\\" not in logger.display_path(tmp_path / "skill" / "a" / "skill.md")
+
+
+#### Execution confirmation & dry run ####
+
+def test_completion_log_warns_when_instructions_never_reach_model(tmp_path):
+    agent = build_skill_agent(
+        tmp_path,
+        ['<tool>{"name":"use_skill","args":{"query":"unit-tests"}}</tool>'],
+        max_steps=1,
+    )
+
+    agent.ask("Implement binary search")
+
+    log = read_log(tmp_path)
+    assert "model_calls_with_instructions=0" in log
+    assert "WARNING: instructions never reached the model" in log
+
+
+def test_skill_check_dry_run_logs_without_calling_model(tmp_path, capsys):
+    exit_code = main(["--cwd", str(tmp_path), "--quiet-skills", "--skill-check", "review", "my", "pull", "request"])
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "DRY RUN: would execute pr-review" in out
+    assert "Active skill: pr-review" in out
+    log = (tmp_path / "logs" / "skill_execution.log").read_text(encoding="utf-8")
+    assert "| SKILL_TRIGGERED | skill=pr-review" in log
+    assert "SKILL_EXECUTION_COMPLETE" not in log
+
+
+def test_skill_check_requires_prompt(tmp_path):
+    with pytest.raises(SystemExit):
+        main(["--cwd", str(tmp_path), "--skill-check"])
+
+
+def test_demo_script_runs_end_to_end(tmp_path, capsys):
+    import importlib.util
+
+    script = Path(__file__).resolve().parents[1] / "scripts" / "demo_skills.py"
+    spec = importlib.util.spec_from_file_location("demo_skills", script)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    assert module.main(["--cwd", str(tmp_path)]) == 0
+
+    log = (tmp_path / "logs" / "skill_execution.log").read_text(encoding="utf-8")
+    assert "skill=pr-review score=" in log and "source=user_prompt" in log
+    assert "NO_SKILL_TRIGGERED" in log
+    assert "skill=unit-tests" in log and "source=agent_request" in log
+    assert log.count("SKILL_EXECUTION_COMPLETE") == 2
+    assert "model_calls_with_instructions=0" not in log

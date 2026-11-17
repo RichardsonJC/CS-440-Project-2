@@ -1,0 +1,8 @@
+{
+  "pre_tool": [
+    {"match": "run_shell", "command": "{python} hooks/block_dangerous_shell.py"}
+  ],
+  "post_tool": [
+    {"match": "write_file|patch_file", "command": "{python} hooks/check_python_syntax.py"}
+  ]
+}
